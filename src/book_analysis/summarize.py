@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """Summarize one book with a language model and add the summary to its document in gutenberg.books.
-
+ 
 Usage: summarize.py BOOK_LIST TASK_ID
-
+ 
 BOOK_LIST has the header "File path", then the path of one book file per line. TASK_ID,
 counted from 1, picks the book, so each task of a Slurm job array summarizes one book. The file name, for example
 pg11.txt, is the book's _id in MongoDB: its key in your S3 bucket in Labs 06 and 07.
 """
-
+ 
 import logging
 import os
 import socket
 import sys
 import time
 from datetime import datetime, timezone
-
+ 
 import torch
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from transformers import pipeline
-
+ 
 logger = logging.getLogger(__name__)
-
+ 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 GENRES = ["adventure", "romance", "horror", "science fiction", "mystery", "satire",
           "historical fiction", "children's story", "poetry", "drama"]
@@ -31,8 +31,8 @@ MAX_WORDS = 20000
 PROMPT = ("{excerpt}\n\nThat was the beginning of a book. Summarize the story in three sentences. "
           "Then, on a new line, write 'Genre: ' and the genre that fits best, one of: {genres}. "
           "Write plain text, without Markdown.")
-
-
+ 
+ 
 def read_book(path):
     """Return the text of a book file, without Project Gutenberg's header and license."""
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -42,8 +42,8 @@ def read_book(path):
     end = text.find("*** END OF")
     begin = text.find("\n", start) + 1 if start != -1 else 0
     return text[begin:end if end != -1 else len(text)]
-
-
+ 
+ 
 def summarize_book(text):
     """Return a summary of the book, three sentences long, and its genre, one of GENRES or "unknown"."""
     device = "cuda" if torch.cuda.is_available() else "cpu"  # the GPU, if the task has one
@@ -60,19 +60,69 @@ def summarize_book(text):
     summary = summary.strip().removeprefix("Summary:").strip()  # without a label "Summary:" at the start
     genre = genre.strip().strip(".").lower()
     return summary, genre if genre in GENRES else "unknown"
-
-
+ 
+ 
 def upload_summary(key, summary, genre, job):
     """Add the summary and genre to the document with _id key in gutenberg.books, and add a run."""
-    # TODO: Part 1, Step 1 of README.md
-    raise NotImplementedError("upload_summary")
-
-
+    # Same environment variables as in Lab 05 (adjust the names if yours differ)
+    client = MongoClient(os.environ["MONGODB_ATLAS_URL"],
+                         username=os.environ["MONGODB_ATLAS_USER"],
+                         password=os.environ["MONGODB_ATLAS_PWD"])
+    try:
+        now = datetime.now(timezone.utc)
+        result = client["gutenberg"]["books"].update_one(
+            {"_id": key},
+            {"$set": {"llm_analysis": {"summary": summary, "genre": genre, "model": MODEL, "at": now}},
+             "$push": {"runs": {"host": socket.gethostname(), "at": now, "job": job}}})
+        if result.matched_count == 0:
+            logger.warning("No document with _id %s in gutenberg.books", key)
+    except PyMongoError as e:
+        logger.error("Could not update the document %s: %s", key, e)
+        raise  # the task ends as FAILED instead of COMPLETED without a summary
+    finally:
+        client.close()
+ 
+ 
 def main():
     """Summarize book number TASK_ID of BOOK_LIST and save the result in MongoDB."""
-    # TODO: Part 1, Step 1 of README.md
-    raise NotImplementedError("main")
-
-
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+ 
+    if len(sys.argv) != 3:
+        logger.error("Usage: summarize.py BOOK_LIST TASK_ID")
+        sys.exit(1)
+    book_list = sys.argv[1]
+    try:
+        task_id = int(sys.argv[2])
+    except ValueError:
+        logger.error("TASK_ID must be an integer, not %s. Usage: summarize.py BOOK_LIST TASK_ID", sys.argv[2])
+        sys.exit(1)
+ 
+    # The paths of the books, without empty lines and without the header
+    with open(book_list, encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    paths = [line for line in lines if line != "File path"]
+ 
+    if not 1 <= task_id <= len(paths):
+        logger.error("Task number %d is not valid: use 1 to %d", task_id, len(paths))
+        sys.exit(1)
+ 
+    path = paths[task_id - 1]  # task 1 is the first book
+    key = path.split("/")[-1]  # "/scratch/mst3k/books/pg11.txt" -> "pg11.txt"
+    logger.info("Task %d: %s", task_id, path)
+ 
+    start = time.time()
+    summary, genre = summarize_book(read_book(path))
+    elapsed = time.time() - start
+    logger.info("%s: genre %s, summarized in %.1f s", key, genre, elapsed)
+ 
+    # Slurm sets these two variables in each task of a job array; outside of Slurm, job is None
+    array_job = os.environ.get("SLURM_ARRAY_JOB_ID")
+    array_task = os.environ.get("SLURM_ARRAY_TASK_ID")
+    job = f"{array_job}_{array_task}" if array_job and array_task else None
+ 
+    upload_summary(key, summary, genre, job)
+    print(f"Summarized {key} in {elapsed:.1f} s on {socket.gethostname()}")
+ 
+ 
 if __name__ == "__main__":
     main()
